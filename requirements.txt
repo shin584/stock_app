@@ -1,3 +1,4 @@
 streamlit
 pykrx
 pandas
+setuptools
