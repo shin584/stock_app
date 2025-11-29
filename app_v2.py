@@ -65,8 +65,8 @@ def get_recent_business_days(ref_date_str, duration=3):
 def get_consecutive_tickers_sets(market, valid_days):
     """
     반환값: (strict_set, relaxed_set)
-    strict_set: 외국인, 투신, 연기금 모두 연속 순매수 (AND)
-    relaxed_set: 외국인, 투신, 연기금 중 하나라도 연속 순매수 (OR)
+    strict_set: 외국인, 투신, 연기금 모두 연속 순매수 (3개 교집합)
+    relaxed_set: 외국인, 투신, 연기금 중 2개 이상 연속 순매수
     """
     try:
         if not valid_days:
@@ -106,8 +106,13 @@ def get_consecutive_tickers_sets(market, valid_days):
         if trust_consecutive is None: trust_consecutive = set()
         if pension_consecutive is None: pension_consecutive = set()
         
+        # Strict: 3개 모두 교집합
         strict_set = for_consecutive.intersection(trust_consecutive).intersection(pension_consecutive)
-        relaxed_set = for_consecutive.union(trust_consecutive).union(pension_consecutive)
+        
+        # Relaxed: 2개 이상 교집합 ((A&B) | (B&C) | (A&C))
+        relaxed_set = (for_consecutive & trust_consecutive) | \
+                      (trust_consecutive & pension_consecutive) | \
+                      (for_consecutive & pension_consecutive)
         
         return strict_set, relaxed_set
     except Exception as e:
@@ -218,19 +223,19 @@ def analyze_market_v2(market, date_str):
         inv_trust_buy = row['투신_순매수']
         pension_buy = row['연기금_순매수']
         
-        # Priority 1 (빈집털이형)
-        if (prog_buy < 0) and (for_buy > 0) and ((inv_trust_buy + pension_buy) > 0):
+        # Priority 1 (빈집털이형) - Strict History Required
+        if is_strict and (prog_buy < 0) and (for_buy > 0) and ((inv_trust_buy + pension_buy) > 0):
             score += 100
             priority_type = "1순위 (빈집털이)"
             reasons.append("프로그램 매도세 극복")
             
-        # Priority 2 (정석 주도주형)
-        elif (for_buy > 0) and (inv_trust_buy > 0) and (pension_buy > 0):
+        # Priority 2 (정석 주도주형) - Strict History Required
+        elif is_strict and (for_buy > 0) and (inv_trust_buy > 0) and (pension_buy > 0):
             score += 70
             priority_type = "2순위 (정석 주도주)"
             reasons.append("외인/투신/연기금 동반 매수")
             
-        # Priority 3 (차선책)
+        # Priority 3 (차선책) - Relaxed History OK
         else:
             buy_count = 0
             if for_buy > 0: buy_count += 1
@@ -283,18 +288,10 @@ def analyze_market_v2(market, date_str):
     progress_bar.empty()
     status_text.empty()
     
-    # 후처리: 엄격 조건 만족 종목이 있으면 그것만 남김
-    strict_results = [r for r in results if r['is_strict']]
-    if strict_results:
-        results = strict_results
-        msg = "엄격 조건(3주체 모두 연속 순매수) 만족 종목이 발견되어 필터링되었습니다."
-    else:
-        msg = "엄격 조건 만족 종목이 없어, 연속 순매수 조건을 완화(1주체 이상)하여 표시합니다."
-    
     # 정렬: 1. 순위(오름차순), 2. 점수(내림차순), 3. 합계(내림차순)
     results.sort(key=lambda x: (x['priority'], -x['score'], -x['total_avg']))
     
-    return {"results": results, "msg": msg}
+    return {"results": results}
 
 # -----------------------------------------------------------------------------
 # Streamlit UI
@@ -332,9 +329,6 @@ if run_btn:
             st.error(data["error"])
         else:
             results = data["results"]
-            msg = data.get("msg", "")
-            if msg:
-                st.info(msg)
             st.success(f"분석 완료! 총 {len(results)}개 종목이 포착되었습니다.")
             
             if not results:
