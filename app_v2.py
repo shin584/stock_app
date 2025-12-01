@@ -62,6 +62,44 @@ def get_recent_business_days(ref_date_str, duration=3):
     except:
         return []
 
+def get_foreign_ownership_change(market, current_date_str, days_ago=30):
+    """
+    최근 30일간 외국인 지분율 변동폭 계산
+    """
+    try:
+        # 현재 지분율
+        df_curr = stock.get_exhaustion_rates_of_foreign_investment_by_ticker(current_date_str, market)
+        df_curr = df_curr[['지분율']].rename(columns={'지분율': '지분율_현재'})
+        
+        # 30일 전 영업일 찾기
+        curr_dt = datetime.strptime(current_date_str, "%Y%m%d")
+        target_dt = curr_dt - timedelta(days=days_ago)
+        
+        # 넉넉하게 10일 전부터 검색해서 가장 최근 영업일 확보
+        search_start = target_dt - timedelta(days=10)
+        search_end = target_dt
+        
+        # 삼성전자 기준으로 영업일 확인
+        df_days = stock.get_market_ohlcv_by_date(search_start.strftime("%Y%m%d"), search_end.strftime("%Y%m%d"), "005930")
+        
+        if df_days.empty:
+            return None
+            
+        prev_date_str = df_days.index[-1].strftime("%Y%m%d")
+        
+        # 과거 지분율
+        df_prev = stock.get_exhaustion_rates_of_foreign_investment_by_ticker(prev_date_str, market)
+        df_prev = df_prev[['지분율']].rename(columns={'지분율': '지분율_과거'})
+        
+        # 병합 및 변동폭 계산
+        df_merge = df_curr.join(df_prev, how='left')
+        df_merge['지분변동'] = df_merge['지분율_현재'] - df_merge['지분율_과거']
+        
+        return df_merge[['지분변동']]
+    except Exception as e:
+        print(f"지분율 분석 실패: {e}")
+        return None
+
 def get_consecutive_tickers_sets(market, valid_days):
     """
     반환값: (strict_set, relaxed_set, for_consecutive, trust_consecutive, pension_consecutive)
@@ -122,9 +160,12 @@ def analyze_market_v2(market, date_str):
     valid_days = get_recent_business_days(date_str, 3)
     if len(valid_days) < 3:
         return {"error": "최근 3일치 영업일을 확보하지 못했습니다."}
+    
+    # 실제 분석 기준일 (휴장일 선택 시 가장 최근 영업일로 자동 조정됨)
+    actual_date_str = valid_days[-1]
         
     # 2. 당일 데이터 수집 (필터링 및 로직용)
-    df, error = get_market_data(date_str, market)
+    df, error = get_market_data(actual_date_str, market)
     if error:
         return {"error": error}
         
@@ -167,6 +208,14 @@ def analyze_market_v2(market, date_str):
             
     # 당일 데이터와 평균 데이터 병합
     df = df.join(df_avgs, how='left').fillna(0)
+    
+    # 4. 외국인 지분 변동 (30일)
+    df_foreign_change = get_foreign_ownership_change(market, actual_date_str, 30)
+    if df_foreign_change is not None:
+        df = df.join(df_foreign_change, how='left')
+        df['지분변동'] = df['지분변동'].fillna(0)
+    else:
+        df['지분변동'] = 0
     
     results = []
     
@@ -232,13 +281,13 @@ def analyze_market_v2(market, date_str):
         # Priority 1 (빈집털이형) - No History Required
         if is_priority_1:
             score += 100
-            priority_type = "1순위 (빈집털이)"
+            priority_type = "1순위"
             reasons.append("프로그램 매도세 극복")
             
         # Priority 2 (정석 주도주형) - Strict History Required
         elif is_strict and (for_buy > 0) and (inv_trust_buy > 0) and (pension_buy > 0):
             score += 70
-            priority_type = "2순위 (정석 주도주)"
+            priority_type = "2순위"
             reasons.append("외인/투신/연기금 동반 매수")
             
         # Priority 3 (차선책) - Relaxed History OK
@@ -272,7 +321,7 @@ def analyze_market_v2(market, date_str):
                 
                 if pass_filter:
                     score += 40
-                    priority_type = "3순위 (차선책)"
+                    priority_type = "3순위"
                     reasons.append(f"주요 주체 {buy_count}곳 매수")
         
         # 점수가 없으면 탈락
@@ -314,7 +363,8 @@ def analyze_market_v2(market, date_str):
                 '연기금': row['연기금_평균'],
                 '금융투자': row['금융투자_평균']
             },
-            'is_strict': is_strict
+            'is_strict': is_strict,
+            'foreign_diff': row['지분변동']
         })
         
     progress_bar.empty()
@@ -323,7 +373,7 @@ def analyze_market_v2(market, date_str):
     # 정렬: 1. 순위(오름차순), 2. 점수(내림차순), 3. 합계(내림차순)
     results.sort(key=lambda x: (x['priority'], -x['score'], -x['total_avg']))
     
-    return {"results": results}
+    return {"results": results, "actual_date": actual_date_str}
 
 # -----------------------------------------------------------------------------
 # Streamlit UI
@@ -362,6 +412,11 @@ if run_btn:
             st.error(data["error"])
         else:
             results = data["results"]
+            actual_date = data.get("actual_date", date_str)
+            
+            if actual_date != date_str:
+                st.warning(f"선택하신 날짜는 휴장일이거나 데이터가 없어, 가장 최근 영업일인 {actual_date} 기준으로 분석했습니다.")
+            
             st.success(f"분석 완료! 총 {len(results)}개 종목이 포착되었습니다.")
             
             if not results:
@@ -374,13 +429,14 @@ if run_btn:
                     rows.append({
                         "순위": r['priority'],
                         "점수": r['score'],
-                        "종목명": f"{r['name']}({r['ticker']})",
+                        "종목명": r['name'][:4],
                         "등락률": f"{r['fluctuation']:.2f}%",
                         "특이사항": r['reasons'],
                         "합계": round(r['total_avg'] / 100000000, 1),
                         "외국인": round(amt['외국인'] / 100000000, 1),
                         "투신": round(amt['투신'] / 100000000, 1),
                         "연기금": round(amt['연기금'] / 100000000, 1),
+                        "외인지분변동": f"{r['foreign_diff']:.2f}%p" if r['foreign_diff'] > 0 else f"{r['foreign_diff']:.2f}%p",
                     })
                 
                 df_res = pd.DataFrame(rows)
@@ -389,17 +445,15 @@ if run_btn:
                 st.dataframe(
                     df_res,
                     column_config={
-                        "점수": st.column_config.ProgressColumn(
+                        "점수": st.column_config.NumberColumn(
                             "점수",
-                            help="알고리즘 기반 점수",
                             format="%d",
-                            min_value=0,
-                            max_value=130,
                         ),
                         "합계": st.column_config.NumberColumn("합계(억)"),
                         "외국인": st.column_config.NumberColumn("외국인(억)"),
                         "투신": st.column_config.NumberColumn("투신(억)"),
                         "연기금": st.column_config.NumberColumn("연기금(억)"),
+                        "외인지분변동": st.column_config.TextColumn("외인지분변동(30일)"),
                     },
                     hide_index=True,
                     use_container_width=True
